@@ -51,7 +51,10 @@ features = [
 ]
 
 [target."cfg(any(target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"netbsd\", target_os = \"openbsd\"))".dependencies]
-zbus = { workspace = true }
+zbus = { version = "6.2", default-features = false, features = [
+  "default-rt",
+  "proxy",
+] }
 url = { workspace = true }
 
 [target."cfg(target_os = \"macos\")".dependencies.objc2-app-kit]

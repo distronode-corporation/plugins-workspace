@@ -294,8 +294,11 @@ mod imp {
     #[cfg(all(unix, not(target_os = "macos")))]
     use std::{
         collections::HashMap,
-        sync::{Mutex, OnceLock, Weak},
+        sync::{Mutex, OnceLock, Weak, mpsc},
     };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    use futures_lite::StreamExt;
 
     use serde_json::{Value, json};
 
@@ -350,7 +353,7 @@ mod imp {
     #[derive(Default)]
     pub(crate) struct Tracker {
         /// The connection the signals arrive on; `None` when it could not be set up.
-        connection: OnceLock<Option<zbus::blocking::Connection>>,
+        connection: OnceLock<Option<zbus::Connection>>,
         /// The tracked notifications the server still shows, by server id: their identifier and
         /// the payload their actions carry.
         pub(super) shown: Mutex<HashMap<u32, (i32, Value)>>,
@@ -566,7 +569,7 @@ mod imp {
         // Held while the notification is sent, so a signal that arrives before the server id is
         // recorded waits for it instead of being missed.
         let mut shown = lock(&tracker.shown);
-        if let Ok(server_id) = notify(connection, &notification) {
+        if let Ok(server_id) = zbus::block_on(notify(connection, &notification)) {
             if let Some(data) = data {
                 shown.insert(server_id, (id, data));
             }
@@ -580,8 +583,8 @@ mod imp {
     /// some servers, like dunst, send the signals of a notification only to the connection that
     /// sent it. Returns the server id of the notification.
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn notify(
-        connection: &zbus::blocking::Connection,
+    async fn notify(
+        connection: &zbus::Connection,
         notification: &notify_rust::Notification,
     ) -> zbus::Result<u32> {
         // the only hint the plugin sets
@@ -590,7 +593,7 @@ mod imp {
             .iter()
             .filter_map(|hint| match hint {
                 notify_rust::Hint::SoundName(name) => {
-                    Some(("sound-name", zbus::zvariant::Value::from(name.as_str())))
+                    Some(("sound-name", zbus::Variant::from(name.as_str())))
                 }
                 _ => None,
             })
@@ -612,7 +615,8 @@ mod imp {
                     hints,
                     -1i32,
                 ),
-            )?
+            )
+            .await?
             .body()
             .deserialize()
     }
@@ -621,23 +625,43 @@ mod imp {
     /// notification server, then handles them on a thread of its own until the plugin goes away.
     /// The subscription is in place when this returns, so no signal of a later notification is
     /// missed.
+    ///
+    /// The connection lives inside `zbus::block_on` on a second thread, which stays in that call
+    /// and only hands the signals on. It must never block: with zbus 6 the thread that built a
+    /// connection is the one that reads its replies, so a handler that waits there, for the lock
+    /// `track` holds while it waits for a reply or for a call of its own, would never return.
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn listen(shared: Weak<Shared>) -> Option<zbus::blocking::Connection> {
-        let (_, path, interface) = BUS;
-        let connection = zbus::blocking::Connection::session().ok()?;
-        let rule = zbus::MatchRule::builder()
-            .msg_type(zbus::message::Type::Signal)
-            .path(path)
-            .ok()?
-            .interface(interface)
-            .ok()?
-            .build();
-        let signals =
-            zbus::blocking::MessageIterator::for_match_rule(rule, &connection, None).ok()?;
+    fn listen(shared: Weak<Shared>) -> Option<zbus::Connection> {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (signal_tx, signal_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("notification-dbus".into())
+            .spawn(move || {
+                zbus::block_on(async move {
+                    let Some((connection, mut signals)) = subscribe().await else {
+                        let _ = ready_tx.send(None);
+                        return;
+                    };
+                    if ready_tx.send(Some(connection)).is_err() {
+                        return;
+                    }
+                    while let Some(signal) = signals.next().await {
+                        let Ok(signal) = signal else {
+                            continue;
+                        };
+                        // Fails once the plugin went away and the other thread with it.
+                        if signal_tx.send(signal).is_err() {
+                            return;
+                        }
+                    }
+                });
+            })
+            .ok()?;
+        let connection = ready_rx.recv().ok().flatten()?;
         std::thread::Builder::new()
             .name("notification-actions".into())
             .spawn(move || {
-                for signal in signals.flatten() {
+                for signal in signal_rx {
                     let Some(shared) = shared.upgrade() else {
                         return;
                     };
@@ -646,6 +670,24 @@ mod imp {
             })
             .ok()?;
         Some(connection)
+    }
+
+    /// Linux and the BSDs: connects to the session bus and subscribes to the signals of the
+    /// notification server.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    async fn subscribe() -> Option<(zbus::Connection, zbus::MessageStream)> {
+        let (_, path, interface) = BUS;
+        let connection = zbus::Connection::session().await.ok()?;
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .path(path)
+            .interface(interface)
+            .build()
+            .ok()?;
+        let signals = zbus::MessageStream::for_match_rule(rule, &connection, None)
+            .await
+            .ok()?;
+        Some((connection, signals))
     }
 
     /// Linux and the BSDs: reports an `ActionInvoked` signal of a tracked notification and forgets
@@ -696,16 +738,30 @@ mod imp {
             .filter(|(_, (id, _))| ids.is_none_or(|ids| ids.contains(id)))
             .map(|(server_id, _)| *server_id)
             .collect::<Vec<_>>();
-        let (destination, path, interface) = BUS;
-        for server_id in server_ids {
-            let _ = connection.call_method(
-                Some(destination),
-                path,
-                Some(interface),
-                "CloseNotification",
-                &(server_id,),
-            );
+        if server_ids.is_empty() {
+            return;
         }
+        let (destination, path, interface) = BUS;
+        // `zbus::block_on` panics with zbus's `tokio` feature when the caller is inside a tokio
+        // runtime already, as the async `remove_active` command is, so the calls are made on a
+        // thread of their own.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                zbus::block_on(async {
+                    for server_id in server_ids {
+                        let _ = connection
+                            .call_method(
+                                Some(destination),
+                                path,
+                                Some(interface),
+                                "CloseNotification",
+                                &(server_id,),
+                            )
+                            .await;
+                    }
+                })
+            });
+        });
     }
 
     /// macOS and Windows: `notify-rust` cannot remove a shown notification.
@@ -805,11 +861,10 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     fn signal(
         member: &str,
-        body: &(impl serde::Serialize + zbus::zvariant::DynamicType),
+        body: &(impl serde::Serialize + zbus::DynamicType),
     ) -> zbus::message::Message {
         let (_, path, interface) = imp::BUS;
         zbus::message::Message::signal(path, interface, member)
-            .unwrap()
             .build(body)
             .unwrap()
     }

@@ -213,32 +213,32 @@ mod imp {
     use std::path::PathBuf;
 
     pub fn reveal_items_in_dir(paths: &[PathBuf]) -> crate::Result<()> {
-        // `zbus::blocking` starts its own tokio runtime when zbus is built with the `tokio` feature,
+        // `zbus::block_on` starts its own tokio runtime when zbus is built with the `tokio` feature,
         // which panics with "Cannot start a runtime from within a runtime" if the caller is already
         // inside one (e.g. an async command), so always run it on a dedicated thread.
         std::thread::scope(|s| {
-            s.spawn(|| reveal_items_in_dir_blocking(paths))
+            s.spawn(|| zbus::block_on(reveal_items_in_dir_async(paths)))
                 .join()
                 .unwrap_or_else(|e| std::panic::resume_unwind(e))
         })
     }
 
-    fn reveal_items_in_dir_blocking(paths: &[PathBuf]) -> crate::Result<()> {
-        let connection = zbus::blocking::Connection::session()?;
+    async fn reveal_items_in_dir_async(paths: &[PathBuf]) -> crate::Result<()> {
+        let connection = zbus::Connection::session().await?;
 
-        reveal_with_filemanager1(paths, &connection).or_else(|e| {
+        match reveal_with_filemanager1(paths, &connection).await {
+            Ok(()) => Ok(()),
             // Fallback to opening the directory of the first item if revealing multiple items fails.
-            if let Some(first_path) = paths.first() {
-                reveal_with_open_uri_portal(first_path, &connection)
-            } else {
-                Err(e)
-            }
-        })
+            Err(e) => match paths.first() {
+                Some(first_path) => reveal_with_open_uri_portal(first_path, &connection).await,
+                None => Err(e),
+            },
+        }
     }
 
-    fn reveal_with_filemanager1(
+    async fn reveal_with_filemanager1(
         paths: &[PathBuf],
-        connection: &zbus::blocking::Connection,
+        connection: &zbus::Connection,
     ) -> crate::Result<()> {
         let uris: Result<Vec<_>, _> = paths
             .iter()
@@ -259,14 +259,14 @@ mod imp {
             async fn ShowItems(&self, name: Vec<&str>, arg2: &str) -> crate::Result<()>;
         }
 
-        let proxy = FileManager1ProxyBlocking::new(connection)?;
+        let proxy = FileManager1Proxy::new(connection).await?;
 
-        proxy.ShowItems(uri_strs, "")
+        proxy.ShowItems(uri_strs, "").await
     }
 
-    fn reveal_with_open_uri_portal(
+    async fn reveal_with_open_uri_portal(
         path: &Path,
-        connection: &zbus::blocking::Connection,
+        connection: &zbus::Connection,
     ) -> crate::Result<()> {
         let uri = url::Url::from_file_path(path)
             .map_err(|_| crate::Error::FailedToConvertPathToFileUrl)?;
@@ -285,9 +285,9 @@ mod imp {
             ) -> crate::Result<()>;
         }
 
-        let proxy = PortalDesktopProxyBlocking::new(connection)?;
+        let proxy = PortalDesktopProxy::new(connection).await?;
 
-        proxy.OpenDirectory("", uri.as_str(), HashMap::new())
+        proxy.OpenDirectory("", uri.as_str(), HashMap::new()).await
     }
 }
 
