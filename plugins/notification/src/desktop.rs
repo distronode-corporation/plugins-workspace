@@ -627,9 +627,10 @@ mod imp {
     /// missed.
     ///
     /// The connection lives inside `zbus::block_on` on a second thread, which stays in that call
-    /// and only hands the signals on. It must never block: with zbus 6 the thread that built a
-    /// connection is the one that reads its replies, so a handler that waits there, for the lock
-    /// `track` holds while it waits for a reply or for a call of its own, would never return.
+    /// and only hands the signals on. It must never block: with zbus's default runtime, the thread
+    /// that built a connection is the one that reads its replies, so a handler that waited there,
+    /// for the lock `track` holds while it waits for a reply or for a call of its own, would never
+    /// return.
     #[cfg(all(unix, not(target_os = "macos")))]
     fn listen(shared: Weak<Shared>) -> Option<zbus::Connection> {
         let (ready_tx, ready_rx) = mpsc::channel();
